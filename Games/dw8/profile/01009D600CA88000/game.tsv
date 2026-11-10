@@ -1,0 +1,38 @@
+# Provisional game profile (from profile_guess.py; not promoted to dm/games)
+# 真・三國無双７ with 猛将伝 DX, SDK 5, survey PATH_REMOVED
+
+# ---- Identity ----
+title_id	01009D600CA88000
+program_id	01009D600CA88000
+
+# ---- App ----
+name	真・三國無双７ with 猛将伝 DX
+ipa	ShinSangokuMusou7.ipa
+app_category	public.app-category.action-games
+# camera on the right stick, as the other KTGL action games
+pad_layout	full
+
+# ---- Versions ----
+build	v0	1.0.0	main=6fb741b0d2659fb1bd4d990ebf4bd266	subsdk0=be386e8fffc27ba034d83a72d29505a1	subsdk1=68bce9835251c108676398be07480f6d	sdk=a3f254ab1550639946429123cb910126
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from. subsdk0 is NintendoSDK_movie, subsdk1 is GLSLC (7 shaders compiled at boot, captured on the Mac)
+modules	main subsdk0 subsdk1 sdk
+# LINKDATA.BIN + LINKDATA.IDX: KTGL 32-byte records (same as Three Houses' DATA1.bin), kt_gz chunks. Two dlc files failed the NCA hash and were written as read: dlc/13169.bin.gz, dlc/13170.bin.gz
+romfs_marker	LINKDATA.BIN
+zip_store	.bin:.gz:.g1l:.mp4:.png:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/dlc/=dlc /manual/=manual /bgm_nl/=bgmnl /movie/=movie /bgm_xl/=bgmxl
+shader_note	真・三國無双７ with 猛将伝 DX shaders

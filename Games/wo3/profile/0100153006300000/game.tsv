@@ -1,0 +1,35 @@
+# Provisional game profile (from profile_guess.py; not promoted to dm/games)
+# 無双OROCHI２ Ultimate, SDK 1, survey PATH_REMOVED
+
+# ---- Identity ----
+title_id	0100153006300000
+program_id	0100153006300000
+
+# ---- App ----
+name	無双OROCHI２ Ultimate
+ipa	OrochiUltimate.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.0.0	main=1e4ea5c812de9d06c37c4508d50a1daf	subsdk0=2a37ad27c324d28366fce824d494ac6f	subsdk1=51b3e7996b61c8c5b3a253e89c5ba195	subsdk3=17a56a3f438a0053cdb360b37a77c603	subsdk4=1686ae4b62a9c6a3b6ee7a9187ee4932	subsdk5=b43e2fdcf4b3fad2eb10e3680981223f	sdk=972cc2555ec0d6a03473f8c0b03e2413
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# not loaded, main takes nothing from them the host does not supply: subsdk2 (C / libc)
+modules	main subsdk0 subsdk1 subsdk3 subsdk4 subsdk5 sdk
+romfs_marker	LINKDATA.BIN
+zip_store	.bin:.g1l:.idx:.mp4:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/movie2d/=movie2d /bgm/=bgm
+shader_note	無双OROCHI２ Ultimate shaders

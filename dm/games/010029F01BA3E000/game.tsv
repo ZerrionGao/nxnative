@@ -1,0 +1,48 @@
+# Xuan Yuan Sword 7: Unreal Engine 4.25.0, SDK 17.5.3, NVN; base game 1.0.0 (v0).
+# Mac bring-up from the NSP script's provisional profile; see README.md for evidence and limits.
+
+# ---- Identity ----
+title_id	010029F01BA3E000
+program_id	010029F01BA3E000
+
+# ---- App ----
+name	Xuan Yuan Sword 7
+ipa	XuanYuanSword7.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.0.0	main=f8ea898027152437f56d39a18d51b42e	subsdk0=2f9e7f4ec017bb00e214af7c2fd70f4b	sdk=311deab1f062b504f3d646a49ddcd4e8
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	SWD7/Content/Paks/pakchunk1-Switch.pak
+zip_store	.awb:.pak:.ttf:.usm:.metallib
+
+# ---- Memory ----
+# Unreal's generic engine-region cap and FMallocBinned3 host allocator, plus SDK 17.5.3's registered node-area and 1 GB-to-32 MB alignment cuts, fit the 4.06 GB engine region in this 4.375 GB alias region. The 75 s startup probe passed the former abort but remained at the Playerium splash. A follow-up interactive Mac probe continued an existing save from the title into the 3D house scene, reached frame 6600 and mapped alias pages up to +1.50 GB; the reserved engine region ends at +4.125 GB. iPhone launch and gameplay remain untested (docs/reference/memory.md; see Games/xys7/input/010029F01BA3E000_build/ios-probe/formalinteractive/layout.ok)
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 80 MB of system resource
+sys_resource	0x5000000
+
+# ---- Input ----
+# A free camera on the right stick; docked operation mode, 3D controller layout.
+pad_layout	full
+
+# ---- Shader split ----
+# the decoded shader code archives: the engine's global shaders and the game's material shaders
+shader_groups	ShaderArchive-Global-=global ShaderArchive-=game
+shader_note	Xuan Yuan Sword 7 shaders
+
+# heap check: 2026-11-03, heap 0.01 GB
+
+# ---- Address region check ----
+# the game calls nvnDeviceSetDepthMode with near = 0 in the check boot: the pipeline bases made before it runs are made for that mode
+depth_mode	zero
+
+# historical 64 GB Mac address-region check: 2026-11-03, in its first 15 s in nnMain the game's reserved regions reached alias +62.53 GB, within the then-current 64 GB alias region; this was virtual reservation reach, not mapped-page usage (rewrite e8579bcdd10b)
