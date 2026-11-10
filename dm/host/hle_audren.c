@@ -12,7 +12,9 @@
 // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
 //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 // An SDK with none of those render entry points (SDK 1.6: GetAudioRendererWorkBufferSize and OpenAudioRenderer open audren:u and abort when it is not registered) is answered
-// here instead. There is no mixer in that SDK, so the game stays silent. Its audio thread blocks in WaitSystemEvent, and a host thread signals the bound event every 5 ms.
+// here instead. That path used to only pulse the game's renderer event every 5 ms (no mixer: movies still had sound through their own AudioOut, gameplay did not). The host now
+// tracks AppendWaveBuffer / play state / volume on that path and mixes PCM / DSP-ADPCM voices to AudioOut, returning consumed wave buffers from GetReleasedWaveBuffer so the game keeps feeding.
+// Playing ADPCM bytes as PCM16 is piercing noise (無双OROCHI２ Ultimate menu BGM): format defaults must not assume PCM, and buffer size is cross-checked against the ADPCM frame layout.
 #include "hle.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -171,20 +173,304 @@ static void *rev_find(void *obj) {
     pthread_mutex_unlock(&g_rev_mu); return ev;
 }
 // No in-process renderer: do not call the SDK open (it connects to audren:u and Breaks). The handle is a stand-in the later calls never dereference.
-// The game waits on the event it passed (WaitSystemEvent, no timeout), so a host thread signals the bound auto-clear event every 5 ms.
+// The game waits on the event it passed (WaitSystemEvent, no timeout). Soft-mix PCM wave buffers onto AudioOut and signal that event every mixed frame (~5 ms).
 static uint8_t g_silent_obj[0x20] __attribute__((aligned(16)));
 static void *g_pulse_ev;
-static _Atomic int g_pulse_run;
+static _Atomic int g_pulse_run, g_soft_started;
 static pthread_t g_pulse_th;
 static int g_pulse_live;
 static pthread_mutex_t g_pulse_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_soft_mu = PTHREAD_MUTEX_INITIALIZER;
+enum { SOFT_OUTPUT_RATE = 48000 };
+static int g_soft_rate = SOFT_OUTPUT_RATE, g_soft_frame = 240;
+enum { SOFT_VOICES = 128, SOFT_WB = 4,
+       SF_PCM8 = 1, SF_PCM16 = 2, SF_PCM24 = 3, SF_PCM32 = 4, SF_FLOAT = 5, SF_ADPCM = 6 };
+// nn::audio::WaveBuffer as AppendWaveBuffer takes it (SDK 1–early): buffer, size, start/end sample offsets, loop, end-of-stream; ADPCM may carry a loop context at +0x20.
+typedef struct { const void *buffer; size_t size; uint32_t start, end; uint8_t loop, eos; const void *ctx; size_t ctx_sz; } soft_wb_in;
+typedef struct { soft_wb_in in; const void *user; } soft_wb;
+typedef struct {
+    void *voice; int used, playing, channels, format, rate, have_coef, have_format;
+    float volume, pitch;
+    int16_t coef[16];
+    soft_wb q[SOFT_WB]; int qn, qi; uint32_t pos;
+    soft_wb rel[SOFT_WB]; int rn;
+    uint64_t played;
+    uint32_t resample_phase;       // Source position in units of the fixed 48 kHz output rate.
+    int16_t current[2], next[2]; int have_current, have_next;
+    uint8_t adpcm_pred; int16_t adpcm_h0, adpcm_h1; int adpcm_ctx_ok;
+} soft_voice;
+static soft_voice g_soft[SOFT_VOICES];
+static _Atomic uint64_t g_soft_frames, g_soft_nonsilent;
+static int soft_queue_has_room(int queued, int released) { return queued + released < SOFT_WB; }
+enum { ADPCM_FRAME_SAMPLES = 14, ADPCM_FRAME_BYTES = 8, ADPCM_NIBBLES_PER_FRAME = 16 };
+static int soft_adpcm_data_size(int sample_count) {
+    if (sample_count <= 0) return 0;
+    int frames = sample_count / ADPCM_FRAME_SAMPLES, rem = sample_count % ADPCM_FRAME_SAMPLES, extra = 0;
+    if (rem) extra = rem / 2 + 1 + (rem & 1);
+    return frames * ADPCM_FRAME_BYTES + extra;
+}
+static int soft_adpcm_nibble_count(int sample_count) {
+    int header = (sample_count % ADPCM_FRAME_SAMPLES) ? 2 : 0;
+    return sample_count % ADPCM_FRAME_SAMPLES + ADPCM_NIBBLES_PER_FRAME * (sample_count / ADPCM_FRAME_SAMPLES) + header;
+}
+static int16_t soft_adpcm_sat(int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v; }
+static int soft_adpcm_decode(int16_t *out, int out_n, const uint8_t *in, size_t in_sz, int start, int end, int offset,
+                             const int16_t coef[16], uint8_t *pred_scale, int16_t *hist0, int16_t *hist1) {
+    if (!in || !coef || end <= start || out_n <= 0) return 0;
+    int want = end - start - offset; if (want > out_n) want = out_n; if (want <= 0) return 0;
+    int nibbles = soft_adpcm_nibble_count(offset + start);
+    size_t byte_i = (size_t)(nibbles / 2);
+    if (byte_i >= in_sz) return 0;
+    uint8_t pred = *pred_scale, scale = pred & 0xf, cidx = (pred >> 4) & 0xf;
+    if (cidx >= 8) return 0;
+    int16_t c0 = coef[cidx * 2], c1 = coef[cidx * 2 + 1], h0 = *hist0, h1 = *hist1;
+    int produced = 0, rem = want;
+    while (rem > 0 && byte_i < in_sz) {
+        int samples_this;
+        if ((unsigned)nibbles % ADPCM_NIBBLES_PER_FRAME == 0) {
+            pred = in[byte_i++]; scale = pred & 0xf; cidx = (pred >> 4) & 0xf;
+            if (cidx >= 8) return 0;
+            c0 = coef[cidx * 2]; c1 = coef[cidx * 2 + 1]; nibbles += 2;
+            samples_this = rem < ADPCM_FRAME_SAMPLES ? rem : ADPCM_FRAME_SAMPLES;
+        } else samples_this = 1;
+        int scale_fp = (1 << 11) << scale;
+        for (int i = 0; i < samples_this && rem > 0 && byte_i < in_sz; i++) {
+            int value = in[byte_i], sample;
+            if (nibbles & 1) { sample = value & 15; byte_i++; }
+            else sample = value >> 4;
+            if (sample >= 8) sample -= 16;
+            nibbles++;
+            int64_t prediction = (int64_t)c0 * h0 + (int64_t)c1 * h1;
+            int64_t pcm = ((int64_t)sample * scale_fp + prediction + 1024) >> 11;
+            int16_t s = soft_adpcm_sat(pcm);
+            h1 = h0; h0 = s; out[produced++] = s; rem--;
+        }
+    }
+    *pred_scale = pred; *hist0 = h0; *hist1 = h1;
+    return produced;
+}
+static int soft_looks_adpcm(size_t size, uint32_t start, uint32_t end) {
+    if (end <= start) return 0;
+    return soft_adpcm_data_size((int)(end - start)) == (int)size;
+}
+static void soft_refresh_format(soft_voice *v) {
+    if (!v || !v->voice) return;
+    static int (*get_fmt)(const void *), (*get_ch)(const void *), (*get_rate)(const void *), (*get_play)(const void *);
+    static float (*get_pitch)(const void *), (*get_vol)(const void *);
+    if (!get_fmt) {
+        get_fmt = guest_sym("_ZN2nn5audio20GetVoiceSampleFormatEPKNS0_9VoiceTypeE");
+        get_ch = guest_sym("_ZN2nn5audio20GetVoiceChannelCountEPKNS0_9VoiceTypeE");
+        get_rate = guest_sym("_ZN2nn5audio18GetVoiceSampleRateEPKNS0_9VoiceTypeE");
+        get_play = guest_sym("_ZN2nn5audio17GetVoicePlayStateEPKNS0_9VoiceTypeE");
+        get_pitch = guest_sym("_ZN2nn5audio13GetVoicePitchEPKNS0_9VoiceTypeE");
+        get_vol = guest_sym("_ZN2nn5audio14GetVoiceVolumeEPKNS0_9VoiceTypeE");
+    }
+    if (get_fmt) {
+        int f = get_fmt(v->voice);
+        if (f >= SF_PCM8 && f <= SF_ADPCM) { v->format = f; v->have_format = 1; }
+    }
+    if (get_ch) { int c = get_ch(v->voice); if (c > 0 && c <= 6) v->channels = c; }
+    if (get_rate) {
+        int r = get_rate(v->voice);
+        // Dialogue often ships at 24/32 kHz; treat any sane rate as authoritative
+        if (r >= 8000 && r <= 48000) v->rate = r;
+    }
+    // PlayState often flips inside the SDK (direct BL); read it back so FORCE SetVoicePlayState is not required
+    if (get_play) { int st = get_play(v->voice); if (st >= 0 && st <= 2) v->playing = (st == 0); }
+    if (get_pitch) {
+        float p = get_pitch(v->voice);
+        if (p > 0.1f && p < 4.f) v->pitch = p;
+    }
+    if (get_vol) {
+        float vol = get_vol(v->voice);
+        if (vol >= 0.f && vol <= 4.f) v->volume = vol;
+    }
+    static int once;
+    if (!once++ && v->have_format)
+        LOG("audren: soft mixer voice fmt %d ch %d rate %d pitch %.3f vol %.3f playing %d coefs %s",
+            v->format, v->channels, v->rate, v->pitch, v->volume, v->playing, v->have_coef ? "yes" : "no");
+}
+static soft_voice *soft_find(void *voice, int create) {
+    soft_voice *free_slot = NULL;
+    for (int i = 0; i < SOFT_VOICES; i++) {
+        if (g_soft[i].used && g_soft[i].voice == voice) return &g_soft[i];
+        if (!g_soft[i].used && !free_slot) free_slot = &g_soft[i];
+    }
+    if (!create || !free_slot) return NULL;
+    memset(free_slot, 0, sizeof *free_slot);
+    free_slot->used = 1; free_slot->voice = voice; free_slot->volume = 1.f; free_slot->pitch = 1.f;
+    free_slot->channels = 1; free_slot->format = 0; free_slot->rate = g_soft_rate;   // never assume PCM16: ADPCM-as-PCM is piercing noise
+    return free_slot;
+}
+static void soft_clear(void) {
+    pthread_mutex_lock(&g_soft_mu);
+    memset(g_soft, 0, sizeof g_soft);
+    atomic_store(&g_soft_started, 0);
+    pthread_mutex_unlock(&g_soft_mu);
+}
+static int soft_sample_bytes(int format) {
+    switch (format) {
+        case SF_PCM8: return 1;
+        case SF_PCM16: return 2;
+        case SF_PCM24: return 3;
+        case SF_PCM32: case SF_FLOAT: return 4;
+        default: return 0;
+    }
+}
+static void soft_release_head(soft_voice *v) {
+    if (!v->qn) return;
+    if (v->rn < SOFT_WB) v->rel[v->rn++] = v->q[v->qi];
+    v->qi = (v->qi + 1) % SOFT_WB; v->qn--; v->pos = 0; v->adpcm_ctx_ok = 0;
+}
+// Decode each source sample once. Resampling lookahead is retained by the voice,
+// so its predictor history never advances past data that will be decoded again.
+static int soft_read_sample(soft_voice *v, int16_t out[2]) {
+    while (v->qn) {
+        soft_wb *wb = &v->q[v->qi];
+        uint32_t start = wb->in.start, end = wb->in.end;
+        if (!wb->in.buffer || end <= start) { soft_release_head(v); continue; }
+        if (v->pos < start) v->pos = start;
+        if (v->pos >= end) {
+            if (wb->in.loop) { v->pos = start; v->adpcm_ctx_ok = 0; }
+            else { soft_release_head(v); continue; }
+        }
+        int fmt = v->format;
+        if (!v->have_format && soft_looks_adpcm(wb->in.size, start, end)) fmt = SF_ADPCM;
+        if (fmt == SF_ADPCM) {
+            if (!v->have_coef) return 0;
+            if (!v->adpcm_ctx_ok) {
+                // Streaming buffers without a supplied context continue the predictor history.
+                if (wb->in.ctx && wb->in.ctx_sz >= 6) {
+                    const uint8_t *c = wb->in.ctx;
+                    v->adpcm_pred = c[0];
+                    v->adpcm_h0 = (int16_t)(c[2] | (c[3] << 8));
+                    v->adpcm_h1 = (int16_t)(c[4] | (c[5] << 8));
+                }
+                v->adpcm_ctx_ok = 1;
+            }
+            if (soft_adpcm_decode(out, 1, wb->in.buffer, wb->in.size, start, end,
+                    v->pos - start, v->coef, &v->adpcm_pred, &v->adpcm_h0, &v->adpcm_h1) != 1) {
+                soft_release_head(v); continue;
+            }
+            out[1] = out[0];
+        } else {
+            int sb = soft_sample_bytes(fmt), ch = v->channels;
+            if (!sb || ch < 1 || ch > 6) return 0;
+            size_t off = (size_t)v->pos * ch * sb;
+            if (off > wb->in.size || (size_t)ch * sb > wb->in.size - off) {
+                soft_release_head(v); continue;
+            }
+            const uint8_t *src = (const uint8_t *)wb->in.buffer + off;
+            for (int c = 0; c < 2; c++) {
+                const uint8_t *q = src + (c < ch ? c : 0) * sb;
+                int32_t sample = 0;
+                if (fmt == SF_PCM8) sample = (int8_t)*q * 256;
+                else if (fmt == SF_PCM16) { int16_t x; memcpy(&x, q, 2); sample = x; }
+                else if (fmt == SF_PCM24) sample = (int16_t)((q[2] << 8) | q[1]);
+                else if (fmt == SF_PCM32) { int32_t x; memcpy(&x, q, 4); sample = x >> 16; }
+                else { float x; memcpy(&x, q, 4); sample = (int32_t)(fmaxf(-1.f, fminf(1.f, x)) * 32767.f); }
+                out[c] = (int16_t)sample;
+            }
+        }
+        v->pos++;
+        return 1;
+    }
+    return 0;
+}
+static void soft_mix_voice(soft_voice *v, int32_t *acc, int nframe) {
+    soft_refresh_format(v);
+    if (!v->playing) return;
+    int rate = v->rate > 0 ? v->rate : g_soft_rate;
+    float pitch = v->pitch > 0.f && isfinite(v->pitch) ? v->pitch : 1.f;
+    uint32_t step = (uint32_t)fmaxf(1.f, rate * pitch + 0.5f);
+    for (int i = 0; i < nframe; i++) {
+        if (!v->have_current) v->have_current = soft_read_sample(v, v->current);
+        // A high pitch may leave skipped source samples pending after queue starvation.
+        while (v->have_current && v->resample_phase >= SOFT_OUTPUT_RATE) {
+            v->resample_phase -= SOFT_OUTPUT_RATE; v->played++;
+            if (v->have_next) { memcpy(v->current, v->next, sizeof v->current); v->have_next = 0; }
+            else v->have_current = soft_read_sample(v, v->current);
+        }
+        if (!v->have_current) break;
+        if (!v->have_next) v->have_next = soft_read_sample(v, v->next);
+        for (int c = 0; c < 2; c++) {
+            int a = v->current[c], b = v->have_next ? v->next[c] : a;
+            float sample = a + (b - a) * ((float)v->resample_phase / SOFT_OUTPUT_RATE);
+            acc[2 * i + c] += (int32_t)(sample * v->volume * 0.7f);
+        }
+        v->resample_phase += step;
+    }
+}
+static void soft_mix_frame(int16_t *dst, int nframe) {
+    int32_t acc[FRAME_MAX * 2];
+    memset(acc, 0, (size_t)nframe * 2 * sizeof(int32_t));
+    pthread_mutex_lock(&g_soft_mu);
+    if (atomic_load(&g_soft_started)) {
+        for (int i = 0; i < SOFT_VOICES; i++) if (g_soft[i].used) soft_mix_voice(&g_soft[i], acc, nframe);
+    }
+    uint64_t f = atomic_load(&g_soft_frames) + 1;
+    if (f % 2000 == 0) {
+        for (int i = 0; i < SOFT_VOICES; i++) if (g_soft[i].used && g_soft[i].playing && g_soft[i].qn)
+            LOG("audren: soft mixer live voice[%d] fmt %d ch %d rate %d pitch %.3f vol %.3f pos %u q %d",
+                i, g_soft[i].format, g_soft[i].channels, g_soft[i].rate, g_soft[i].pitch, g_soft[i].volume,
+                g_soft[i].pos, g_soft[i].qn);
+    }
+    pthread_mutex_unlock(&g_soft_mu);
+    int loud = 0;
+    for (int i = 0; i < nframe * 2; i++) {
+        int32_t s = acc[i];
+        // Soft clip: hard clamp of summed voices was the sharp edge on dialogue dumps
+        if (s > 30000) s = 30000 + (s - 30000) / 8;
+        if (s < -30000) s = -30000 + (s + 30000) / 8;
+        if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+        dst[i] = (int16_t)s; if (s) loud = 1;
+    }
+    atomic_fetch_add(&g_soft_frames, 1);
+    if (loud) atomic_fetch_add(&g_soft_nonsilent, 1);
+    f = atomic_load(&g_soft_frames);
+    if (f == 200 || f % 12000 == 0)
+        LOG("audren: soft mixer rendered %llu frames, %llu of them not silent",
+            (unsigned long long)f, (unsigned long long)atomic_load(&g_soft_nonsilent));
+    // DM_SOFT_DUMP=<file>: raw s16le stereo at 48000 Hz. Write every frame (including silence)
+    // so gaps between dialogue lines stay in wall-clock time; skipping silence made speech sound rushed.
+    { static FILE *df; static int on = -1;
+      if (on < 0) { const char *e = getenv("DM_SOFT_DUMP"); on = e != NULL; if (on && !(df = fopen(e, "wb"))) { LOG("[RED] DM_SOFT_DUMP cannot open %s", e); on = 0; } }
+      if (on && df) fwrite(dst, 4, (size_t)nframe, df);
+    }
+}
 static void *ar_pulse(void *arg) {
     (void)arg;
+    void *out = dm_pcmout_open(2);
+    static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
+    if (out) {
+        for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+        dm_pcmout_start(out);
+        LOG("audren: soft mixer thread started (no in-process renderer; stream-v2; %d Hz, %d samples/frame)", g_soft_rate, g_soft_frame);
+    } else {
+        LOG("audren: soft mixer has no AudioOut (tests / no device); pacing the renderer event only");
+    }
     while (atomic_load(&g_pulse_run)) {
+        int n = SOFT_OUTPUT_RATE / 200;   // AudioOut is fixed at 48 kHz; one output block is 5 ms at every renderer rate.
+        if (out) {
+            while (!nfree) {
+                gbuf *b = dm_pcmout_released(out);
+                if (b) { free_list[nfree++] = b; break; }
+                dm_pcmout_wait(out, 10);
+                if (!atomic_load(&g_pulse_run)) break;
+            }
+            if (!nfree) break;
+            gbuf *b = free_list[--nfree];
+            soft_mix_frame((int16_t *)b->ptr, n);
+            b->size = (uint64_t)n * 4;
+            if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
+        } else {
+            soft_mix_frame(data[0], n);   // advance voice state even without an output
+            usleep(5000);
+        }
         void *ev = g_pulse_ev;
         if (ev) hle_signal_bound_system_event(ev);
-        usleep(5000);
     }
+    if (out) dm_pcmout_close(out);
     return NULL;
 }
 static void ar_pulse_stop(void) {
@@ -195,6 +481,7 @@ static void ar_pulse_stop(void) {
     if (!live) return;
     pthread_join(th, NULL);
     pthread_mutex_lock(&g_pulse_mu); g_pulse_live = 0; g_pulse_ev = NULL; pthread_mutex_unlock(&g_pulse_mu);
+    soft_clear();
 }
 static void ar_pulse_start(void *ev) {
     pthread_mutex_lock(&g_pulse_mu);
@@ -204,7 +491,7 @@ static void ar_pulse_start(void *ev) {
         if (pthread_create(&g_pulse_th, NULL, ar_pulse, NULL)) {
             atomic_store(&g_pulse_run, 0); g_pulse_ev = NULL;
             pthread_mutex_unlock(&g_pulse_mu);
-            LOG("[RED] audren: cannot start the renderer event thread");
+            LOG("[RED] audren: cannot start the soft mixer thread");
             return;
         }
         g_pulse_live = 1;
@@ -213,9 +500,17 @@ static void ar_pulse_start(void *ev) {
 }
 static Result ar_open_silent(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
     if (handle) { handle[0] = g_silent_obj; handle[1] = NULL; }
+    if (param) {
+        int rate = *(const int32_t *)param, frame = *(const int32_t *)(param + 4);
+        if (rate == 32000 || rate == 48000) g_soft_rate = rate;
+        if (frame > 0 && frame <= FRAME_MAX) g_soft_frame = frame;
+    }
     static int once;
-    if (!once++) LOG("audren: OpenAudioRenderer answered locally (no in-process renderer); sound stays silent. rate %d voices %d work %p+%#zx",
+    if (!once++) LOG("audren: OpenAudioRenderer answered locally (no in-process renderer); soft-mixing PCM voices. rate %d voices %d work %p+%#zx",
         param ? *(const int32_t *)param : 0, param ? *(const int32_t *)(param + 0x10) : 0, work, sz);
+    soft_clear();
+    // StartAudioRenderer often runs only inside the SDK (direct BL), so FORCE Start may never hit. Mix from open.
+    atomic_store(&g_soft_started, 1);
     if (ev) { hle_bind_system_event(ev, 1); ar_pulse_start(ev); }
     return RES_OK;
 }
@@ -290,16 +585,16 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
     }
 }
 // Start, Stop and RequestUpdate on an SDK with a renderer are the SDK's own (16-byte handle in x0/x1, the config in x2). Without one, the SDK copies load the
-// stand-in and send to audren:u, then Break; the game only checks the result (無双OROCHI２ Ultimate main+0x5eb3d4, main+0x5ebae0).
+// stand-in and send to audren:u, then Break; the game only checks the result (無双OROCHI２ Ultimate main+0x5eb3d4, main+0x5ebae0). Soft-mix path: Start/Stop gate mixing.
 HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "start the renderer: the SDK's own when it has one, success without audren:u when it does not",
           Result, h_ar_Start, void *obj, void *state) {
-    if (!ar_cpu_renderer()) return RES_OK;
+    if (!ar_cpu_renderer()) { atomic_store(&g_soft_started, 1); return RES_OK; }
     static Result (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE");
     return orig(obj, state);
 }
 HLE_FORCE("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", "stop the renderer: the SDK's own when it has one, success without audren:u when it does not",
           Result, h_ar_Stop, void *obj, void *state) {
-    if (!ar_cpu_renderer()) return RES_OK;
+    if (!ar_cpu_renderer()) { atomic_store(&g_soft_started, 0); return RES_OK; }
     static Result (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE");
     return orig(obj, state);
 }
@@ -308,6 +603,155 @@ HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPK
     if (!ar_cpu_renderer()) return RES_OK;
     static Result (*orig)(void *, void *, const void *); if (!orig) orig = gsym("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE");
     return orig(obj, state, config);
+}
+
+// Soft-mix voice hooks (SDK without an in-process renderer). With a renderer, these stay the SDK's own.
+HLE_FORCE("_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm",
+          "AcquireVoiceSlot: track format/channels for the soft mixer when the SDK has no CPU renderer",
+          int, h_ar_AcquireVoice, void *config, void *voice, int sample_rate, int channels, int format, int priority, const void *extra, size_t extra_sz) {
+    static int (*orig)(void *, void *, int, int, int, int, const void *, size_t);
+    if (!orig) orig = gsym("_ZN2nn5audio16AcquireVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeEiiNS0_12SampleFormatEiPKvm");
+    int r = orig(config, voice, sample_rate, channels, format, priority, extra, extra_sz);
+    if (!r || ar_cpu_renderer() || !voice) return r;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 1);
+    if (v) {
+        *v = (soft_voice){.voice = voice, .used = 1, .volume = 1.f, .pitch = 1.f};
+        v->format = format; v->have_format = 1;
+        v->channels = channels > 0 ? channels : 1; v->rate = sample_rate > 0 ? sample_rate : g_soft_rate;
+        if (extra && extra_sz >= sizeof v->coef) {
+            memcpy(v->coef, extra, sizeof v->coef); v->have_coef = 1;
+        }
+        static int once;
+        if (!once++) LOG("audren: soft mixer voice format %d channels %d rate %d coefs %s",
+            format, v->channels, v->rate, v->have_coef ? "yes" : "no");
+    }
+    pthread_mutex_unlock(&g_soft_mu);
+    return r;
+}
+HLE_FORCE("_ZN2nn5audio16ReleaseVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeE",
+          "ReleaseVoiceSlot: drop soft-mixer state for a voice when the SDK has no CPU renderer",
+          void, h_ar_ReleaseVoice, void *config, void *voice) {
+    static void (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio16ReleaseVoiceSlotEPNS0_19AudioRendererConfigEPNS0_9VoiceTypeE");
+    if (!ar_cpu_renderer() && voice) {
+        pthread_mutex_lock(&g_soft_mu);
+        soft_voice *v = soft_find(voice, 0);
+        if (v) memset(v, 0, sizeof *v);
+        pthread_mutex_unlock(&g_soft_mu);
+    }
+    orig(config, voice);
+}
+HLE_FORCE("_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE",
+          "AppendWaveBuffer: queue PCM/ADPCM for the soft mixer when the SDK has no CPU renderer",
+          int, h_ar_AppendWB, void *voice, const void *wb) {
+    static int (*orig)(void *, const void *); if (!orig) orig = gsym("_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE");
+    if (ar_cpu_renderer()) return orig(voice, wb);
+    if (!voice || !wb) return 0;
+    const uint8_t *p = (const uint8_t *)wb;
+    soft_wb slot = {0};
+    slot.user = wb;
+    slot.in.buffer = *(const void *const *)p;
+    slot.in.size = *(const uint64_t *)(p + 8);
+    slot.in.start = *(const uint32_t *)(p + 0x10);
+    slot.in.end = *(const uint32_t *)(p + 0x14);
+    slot.in.loop = p[0x18];
+    slot.in.eos = p[0x19];
+    // SDK 1.6 AppendWaveBuffer (sdk+0x15f1f4) reads context at +0x20 and size at +0x28.
+    slot.in.ctx = *(const void *const *)(p + 0x20);
+    slot.in.ctx_sz = *(const uint64_t *)(p + 0x28);
+    if (slot.in.ctx_sz > 0x100 || (slot.in.ctx && !slot.in.ctx_sz)) { slot.in.ctx = NULL; slot.in.ctx_sz = 0; }
+    static int dump;
+    if (!dump++) LOG("audren: soft mixer AppendWaveBuffer buffer %p size %#zx samples %u..%u loop %u adpcm_size %d",
+        slot.in.buffer, slot.in.size, slot.in.start, slot.in.end, slot.in.loop,
+        soft_adpcm_data_size((int)(slot.in.end - slot.in.start)));
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 1);
+    int accepted = 0;
+    if (v) {
+        soft_refresh_format(v);
+        if (!v->have_format && soft_looks_adpcm(slot.in.size, slot.in.start, slot.in.end)) v->format = SF_ADPCM;
+        if (soft_queue_has_room(v->qn, v->rn)) {
+            int idx = (v->qi + v->qn) % SOFT_WB;
+            v->q[idx] = slot; v->qn++; accepted = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_soft_mu);
+    return accepted;
+}
+HLE_FORCE("_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE",
+          "GetReleasedWaveBuffer: return soft-mixer consumed buffers when the SDK has no CPU renderer",
+          const void *, h_ar_GetReleasedWB, void *voice) {
+    if (ar_cpu_renderer()) {
+        static const void *(*orig)(void *); if (!orig) orig = gsym("_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE");
+        return orig(voice);
+    }
+    const void *out = NULL;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 0);
+    if (v && v->rn) { out = v->rel[0].user; memmove(v->rel, v->rel + 1, (size_t)(v->rn - 1) * sizeof v->rel[0]); v->rn--; }
+    pthread_mutex_unlock(&g_soft_mu);
+    return out;
+}
+HLE_FORCE("_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE",
+          "GetWaveBufferCount: report the host soft-mixer queue when the SDK renderer is unavailable",
+          int, h_ar_WaveBufferCount, const void *voice) {
+    if (ar_cpu_renderer()) {
+        static int (*orig)(const void *); if (!orig) orig = gsym("_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE");
+        return orig(voice);
+    }
+    int count = 0;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find((void *)voice, 0);
+    if (v) count = v->qn;
+    pthread_mutex_unlock(&g_soft_mu);
+    return count;
+}
+HLE_FORCE("_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE",
+          "SetVoicePlayState: drive soft-mixer play/stop when the SDK has no CPU renderer",
+          void, h_ar_SetPlay, void *voice, int state) {
+    static void (*orig)(void *, int); if (!orig) orig = gsym("_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE");
+    orig(voice, state);
+    if (ar_cpu_renderer() || !voice) return;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 1);
+    if (v) v->playing = (state == 0);   // PlayState_Start = 0
+    pthread_mutex_unlock(&g_soft_mu);
+}
+HLE_FORCE("_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf",
+          "SetVoicePitch: soft mixer applies pitch as a sample-rate scale when the SDK has no CPU renderer",
+          void, h_ar_SetPitch, void *voice, float pitch) {
+    static void (*orig)(void *, float); if (!orig) orig = gsym("_ZN2nn5audio13SetVoicePitchEPNS0_9VoiceTypeEf");
+    orig(voice, pitch);
+    if (ar_cpu_renderer() || !voice) return;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 1);
+    if (v && pitch > 0.1f && pitch < 4.f) v->pitch = pitch;
+    pthread_mutex_unlock(&g_soft_mu);
+}
+HLE_FORCE("_ZN2nn5audio14SetVoiceVolumeEPNS0_9VoiceTypeEf",
+          "SetVoiceVolume: soft-mixer volume when the SDK has no CPU renderer",
+          void, h_ar_SetVol, void *voice, float volume) {
+    static void (*orig)(void *, float); if (!orig) orig = gsym("_ZN2nn5audio14SetVoiceVolumeEPNS0_9VoiceTypeEf");
+    orig(voice, volume);
+    if (ar_cpu_renderer() || !voice) return;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find(voice, 1);
+    if (v) v->volume = volume;
+    pthread_mutex_unlock(&g_soft_mu);
+}
+HLE_FORCE("_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE",
+          "GetVoicePlayedSampleCount: soft-mixer progress when the SDK has no CPU renderer",
+          uint64_t, h_ar_Played, const void *voice) {
+    if (ar_cpu_renderer()) {
+        static uint64_t (*orig)(const void *); if (!orig) orig = gsym("_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE");
+        return orig(voice);
+    }
+    uint64_t n = 0;
+    pthread_mutex_lock(&g_soft_mu);
+    soft_voice *v = soft_find((void *)voice, 0);
+    if (v) n = v->played;
+    pthread_mutex_unlock(&g_soft_mu);
+    return n;
 }
 
 // DeviceSink input mix buffers → int16 stereo. The command ID is 0x13 in SDK 16; SDK 20 inserted a command before it, making it 0x14 (written at sdk+0x233f44); SDK 8 (Link's Awakening)

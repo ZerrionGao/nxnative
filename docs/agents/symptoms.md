@@ -304,7 +304,8 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 
 ## Audio
 
-- `[RED] sf: the game connects to service audren:u itself`, then `Break#1 reason=0 Result=0 svc` inside `GetAudioRendererWorkBufferSize` (`h_ar_WorkSize`). The process exits 42 before a frame. → [An SDK whose renderer is only `audren:u`](../reference/audio.md#an-sdk-whose-renderer-is-only-audrenu)
+- `[RED] sf: the game connects to service audren:u itself`, then `Break#1 reason=0 Result=0 svc` inside `GetAudioRendererWorkBufferSize` (`h_ar_WorkSize`). The process exits 42 before a frame. After a stub that only answered open/update, movies still had sound (their own AudioOut) while gameplay BGM and combat SFX were silent. → [An SDK whose renderer is only `audren:u`](../reference/audio.md#an-sdk-whose-renderer-is-only-audrenu)
+- after restoring scene audio in an SDK without an in-process renderer, story narration and dialogue sound rushed or garbled. → [Soft-renderer dialogue rushes or becomes unintelligible](../reference/audio.md#soft-renderer-dialogue-rushes-or-becomes-unintelligible)
 - abort with Result 0x499 in `audio::GetAudioRendererWorkBufferSize`. → [SDK 8's longer `AudioRendererParameter`](../reference/audio.md#sdk-8s-longer-audiorendererparameter)
 - the game is silent; only the game's updates render (catch-up frames that nothing plays). The log has `audren: OpenAudioRenderer (no event)` and no `render thread started`. → [A renderer opened without an event](../reference/audio.md#a-renderer-opened-without-an-event)
 - `[RED] audren: a second renderer` right after the first open, with the same work buffer and "original device 1 mode 1". → [The SDK's open with an event calls the open without one (`t_in_open`)](../reference/audio.md#the-sdks-open-with-an-event-calls-the-open-without-one-t_in_open)

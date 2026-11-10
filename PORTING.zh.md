@@ -3,7 +3,7 @@
 本仓库是 [nxnative](https://github.com/seedds/nxnative) 的完整可用副本，并已集成下列修复，**无需再手动打 patch**：
 
 - 跳转表在索引重载后仍识别范围检查（无双大蛇 2）
-- 无进程内渲染器的 SDK 本地应答 `audren`（无声但可启动）
+- 无进程内渲染器的 SDK 本地应答 `audren` 并用软混音播放 PCM / DSP-ADPCM（可启动）
 - 将游戏图形分配器装入 `NvOs`；接受 SDK 1.6 非 const 的 `movie::Buffer`
 - `LINKDATA.BIN` 与 `LINKDATA.IDX` 配对（真三国无双 7）
 - 启动窗在 `DMLanguage` 以 `zh` 开头时显示中文
