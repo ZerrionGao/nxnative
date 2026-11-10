@@ -27,3 +27,23 @@ dm/games/*/cb_extent.tsv
 .coverage
 .coverage.*
 /coverage.json
+
+# Private local credentials and game packages (source-only distribution)
+/keys/
+.env
+.env.*
+!.env.example
+*.nsp
+*.nsz
+*.xcz
+*.nca
+*.pfx
+*.p8
+*.pem
+*.key
+*.cer
+*.der
+*.provisionprofile
+
+# Local alternate-region extraction outside the standard input directory
+/Games/diablo3/us/
